@@ -15,3 +15,6 @@ mkdir -p ~/.local/share/applications; printf '%s\n' '[Desktop Entry]' 'Name=Spot
 update-desktop-database ~/.local/share/applications 2>/dev/null || true
 
 ```
+
+## 2. Lancement apres installation :
+il vous suffit de chercher "spotify skipper" dans votre menu demarrer
