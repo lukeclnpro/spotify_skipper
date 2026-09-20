@@ -1,31 +1,3 @@
-#!/usr/bin/env python3
-"""
-Auto Spotify - surveillance + commandes clavier + icône barre d'état.
-
-Commandes (terminal) :
-  help      Affiche les commandes
-  status    Affiche l'état de Spotify
-  play      Lecture
-  pause     Pause
-  toggle    Lecture / pause
-  next      Morceau suivant
-  prev      Morceau précédent
-  restart   Redémarre Spotify
-  stop      Arrête le programme
-
-Une icône est également ajoutée dans la barre d'état système (system tray)
-avec un menu proposant les mêmes actions.
-
-Dépendances supplémentaires :
-    pip install pystray pillow
-
-Remarque (GNOME) : GNOME Shell n'affiche pas nativement les icônes
-"system tray" / AppIndicator. Il faut installer l'extension
-"AppIndicator and KStatusNotifierItem Support" (extensions.gnome.org)
-pour que l'icône apparaisse dans la barre du haut. Sous KDE, XFCE,
-Cinnamon, MATE, etc. ça fonctionne nativement.
-"""
-
 import shutil
 import subprocess
 import threading
@@ -39,17 +11,30 @@ try:
 except ImportError:
     TRAY_AVAILABLE = False
 
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
 CHECK_INTERVAL = 0.5
 AD_CONFIRMATION_TIME = 2
 SPOTIFY_PLAYER = "spotify"
 
 stop_event = threading.Event()
 state_lock = threading.Lock()
+
+# Évite plusieurs redémarrages simultanés
+restart_lock = threading.Lock()
+
 last_song = None
 ad_start = None
 
-tray_icon = None  # instance pystray.Icon, assignée dans main()
+tray_icon = None
 
+
+# --------------------------------------------------------------------------
+# Commandes système
+# --------------------------------------------------------------------------
 
 def run_command(*args, check=False):
     """Exécute une commande et retourne CompletedProcess."""
@@ -63,15 +48,22 @@ def run_command(*args, check=False):
 
 def playerctl(*args):
     """Exécute playerctl pour Spotify."""
-    return run_command("playerctl", "-p", SPOTIFY_PLAYER, *args)
+    return run_command(
+        "playerctl",
+        "-p",
+        SPOTIFY_PLAYER,
+        *args,
+    )
 
+
+# --------------------------------------------------------------------------
+# Démarrage Spotify
+# --------------------------------------------------------------------------
 
 def wait_for_player_and_play(timeout=20, poll_interval=0.5):
     """
-    Attend que l'interface MPRIS de Spotify soit disponible (le lancement de
-    l'appli ne veut pas dire que playerctl peut déjà lui parler), puis lance
-    la lecture automatiquement. C'est ce qui donne l'impression que la pub
-    a été "skippée" dès l'ouverture.
+    Attend que l'interface MPRIS de Spotify soit disponible,
+    puis lance la lecture.
     """
     deadline = time.time() + timeout
 
@@ -80,6 +72,7 @@ def wait_for_player_and_play(timeout=20, poll_interval=0.5):
             return
 
         result = playerctl("play")
+
         if result.returncode == 0:
             print("▶️ Lecture lancée automatiquement.")
             return
@@ -89,13 +82,63 @@ def wait_for_player_and_play(timeout=20, poll_interval=0.5):
     print("⚠️ Spotify n'a pas répondu à temps, lecture automatique annulée.")
 
 
+def wait_for_player_skip_and_play(timeout=20, poll_interval=0.5):
+    """
+    Attend que Spotify soit disponible après un redémarrage.
+
+    Une fois Spotify disponible :
+        1. passe au morceau/contenu suivant
+        2. attend brièvement que Spotify mette à jour ses métadonnées
+        3. lance la lecture
+
+    Cela évite de reprendre le contenu qui était présent avant
+    le redémarrage, notamment la publicité détectée.
+    """
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        if stop_event.is_set():
+            return False
+
+        # Vérifie que Spotify répond via MPRIS
+        status_result = playerctl("status")
+
+        if status_result.returncode == 0:
+            print("⏭️ Passage au contenu suivant...")
+
+            next_result = playerctl("next")
+
+            if next_result.returncode != 0:
+                print("⚠️ Impossible de passer au contenu suivant.")
+                time.sleep(poll_interval)
+                continue
+
+            # Laisse Spotify actualiser les métadonnées
+            time.sleep(0.7)
+
+            print("▶️ Lancement de la lecture...")
+
+            play_result = playerctl("play")
+
+            if play_result.returncode == 0:
+                print("✅ Nouvelle musique lancée automatiquement.")
+                return True
+
+            print("⚠️ Spotify répond mais la lecture n'a pas pu démarrer.")
+
+        time.sleep(poll_interval)
+
+    print("⚠️ Spotify n'a pas répondu à temps.")
+    return False
+
+
 def start_spotify():
     """Lance Spotify s'il n'est pas déjà actif, puis démarre la lecture."""
     try:
         result = subprocess.run(
             ["pgrep", "-x", "spotify"],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
         )
 
         if result.returncode == 0:
@@ -103,24 +146,32 @@ def start_spotify():
             return
 
         print("🚀 Lancement de Spotify...")
+
         subprocess.Popen(
             ["spotify-launcher"],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
         )
 
         print("⏳ Attente du démarrage de Spotify...")
         print("▶️ Démarrage automatique de la lecture...")
+
         wait_for_player_and_play()
+
         print("✅ Spotify lancé !")
         print()
 
     except FileNotFoundError:
         print("❌ Impossible de lancer Spotify : 'spotify-launcher' est introuvable.")
         print("   Vérifie que Spotify est installé et que spotify-launcher est disponible.")
+
     except Exception as e:
         print(f"❌ Erreur lors du lancement de Spotify : {e}")
 
+
+# --------------------------------------------------------------------------
+# Métadonnées Spotify
+# --------------------------------------------------------------------------
 
 def get_metadata():
     try:
@@ -134,10 +185,12 @@ def get_metadata():
             return None
 
         parts = result.stdout.strip().split("|", 3)
+
         if len(parts) != 4:
             return None
 
         title, artist, album, status = parts
+
         return {
             "title": title.strip(),
             "artist": artist.strip(),
@@ -151,6 +204,7 @@ def get_metadata():
 
 def get_status():
     data = get_metadata()
+
     if data is None:
         return "Spotify non disponible ou playerctl ne répond pas."
 
@@ -166,49 +220,103 @@ def get_status():
     )
 
 
+# --------------------------------------------------------------------------
+# Détection de publicité
+# --------------------------------------------------------------------------
+
 def is_ad(data):
     """
-    Détection prudente :
+    Détection prudente d'une publicité :
+
     - Spotify doit être en lecture
-    - l'artiste OU l'album est vide
+    - l'artiste OU l'album doit être vide
     """
-    if data is None or data["status"] != "playing":
+    if data is None:
+        return False
+
+    if data["status"] != "playing":
         return False
 
     return data["artist"] == "" or data["album"] == ""
 
 
+# --------------------------------------------------------------------------
+# Redémarrage Spotify
+# --------------------------------------------------------------------------
+
 def restart_spotify():
-    print("\n📢 Publicité détectée / redémarrage demandé.")
-    print("🔴 Fermeture de Spotify...")
+    """
+    Ferme Spotify puis le relance.
 
-    subprocess.run(
-        ["pkill", "-x", "spotify"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    Après le redémarrage :
+        Spotify disponible
+              ↓
+        playerctl next
+              ↓
+        courte attente
+              ↓
+        playerctl play
 
-    time.sleep(2)
+    Le 'next' est volontaire : il permet de ne pas relancer le contenu
+    qui était actif avant le redémarrage.
+    """
 
-    launcher = shutil.which("spotify-launcher") or shutil.which("spotify")
-    if not launcher:
-        print("❌ Impossible de trouver spotify-launcher ou spotify.")
+    # Évite deux redémarrages simultanés
+    if not restart_lock.acquire(blocking=False):
+        print("⚠️ Un redémarrage de Spotify est déjà en cours.")
         return
 
-    print("🟢 Relancement de Spotify...")
     try:
+        print("\n📢 Publicité détectée / redémarrage demandé.")
+        print("🔴 Fermeture de Spotify...")
+
+        subprocess.run(
+            ["pkill", "-x", "spotify"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # Laisse Spotify se fermer complètement
+        time.sleep(2)
+
+        launcher = (
+            shutil.which("spotify-launcher")
+            or shutil.which("spotify")
+        )
+
+        if not launcher:
+            print("❌ Impossible de trouver spotify-launcher ou spotify.")
+            return
+
+        print("🟢 Relancement de Spotify...")
+
         subprocess.Popen(
             [launcher],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
         print("⏳ Attente du démarrage de Spotify...")
-        print("▶️ Reprise automatique de la lecture...")
-        wait_for_player_and_play()
-        print("✅ Spotify relancé !\n")
+        print("⏭️ Passage de la publicité / du contenu précédent...")
+        print("▶️ Reprise avec la musique suivante...")
+
+        success = wait_for_player_skip_and_play()
+
+        if success:
+            print("✅ Spotify relancé et nouvelle musique lancée !\n")
+        else:
+            print("⚠️ Le relancement de Spotify a échoué.\n")
+
     except OSError as exc:
         print(f"❌ Erreur lors du lancement : {exc}")
 
+    finally:
+        restart_lock.release()
+
+
+# --------------------------------------------------------------------------
+# Commandes terminal
+# --------------------------------------------------------------------------
 
 def print_help():
     print(
@@ -236,28 +344,37 @@ def execute_command(command):
 
     if command in {"help", "h", "?"}:
         print_help()
+
     elif command in {"status", "s"}:
         print("\n" + get_status() + "\n")
+
     elif command == "play":
         playerctl("play")
         print("▶️ Lecture")
+
     elif command == "pause":
         playerctl("pause")
         print("⏸️ Pause")
+
     elif command == "toggle":
         playerctl("play-pause")
         print("⏯️ Lecture / pause")
+
     elif command in {"next", "n"}:
         playerctl("next")
         print("⏭️ Morceau suivant")
+
     elif command in {"prev", "p"}:
         playerctl("previous")
         print("⏮️ Morceau précédent")
+
     elif command in {"restart", "r"}:
         restart_spotify()
+
     elif command in {"stop", "quit", "exit"}:
         print("👋 Arrêt demandé.")
         request_shutdown()
+
     else:
         print(f"❓ Commande inconnue : {command}. Tape 'help'.")
 
@@ -269,6 +386,7 @@ def command_loop():
     while not stop_event.is_set():
         try:
             command = input("spotify> ")
+
         except (EOFError, KeyboardInterrupt):
             request_shutdown()
             break
@@ -276,10 +394,15 @@ def command_loop():
         execute_command(command)
 
 
+# --------------------------------------------------------------------------
+# Surveillance
+# --------------------------------------------------------------------------
+
 def monitor_loop():
     global last_song, ad_start
 
     while not stop_event.is_set():
+
         data = get_metadata()
 
         if data is None:
@@ -288,15 +411,34 @@ def monitor_loop():
 
         status = data["status"]
 
+        # --------------------------------------------------------------
+        # PUBLICITÉ
+        # --------------------------------------------------------------
+
         if is_ad(data):
+
             if ad_start is None:
                 ad_start = time.time()
-                print("⚠️ Publicité potentielle détectée...")
+
+                print(
+                    "⚠️ Publicité potentielle détectée "
+                    f"(confirmation pendant {AD_CONFIRMATION_TIME}s)..."
+                )
+
             elif time.time() - ad_start >= AD_CONFIRMATION_TIME:
-                restart_spotify()
+
+                # Réinitialise avant le redémarrage
                 ad_start = None
                 last_song = None
+
+                restart_spotify()
+
                 refresh_tray()
+
+        # --------------------------------------------------------------
+        # MUSIQUE NORMALE
+        # --------------------------------------------------------------
+
         else:
             ad_start = None
 
@@ -307,6 +449,7 @@ def monitor_loop():
             )
 
             if current_song != last_song:
+
                 print(
                     "\n🎵 NOUVELLE MUSIQUE\n"
                     f"   🎶 {data['title'] or 'Inconnu'}\n"
@@ -314,15 +457,22 @@ def monitor_loop():
                     f"   💿 {data['album'] or 'Inconnu'}\n"
                     f"   ▶️ {status.capitalize()}\n"
                 )
+
                 last_song = current_song
+
                 refresh_tray()
 
         time.sleep(CHECK_INTERVAL)
 
 
+# --------------------------------------------------------------------------
+# Arrêt
+# --------------------------------------------------------------------------
+
 def request_shutdown():
-    """Arrête proprement la surveillance, la boucle de commandes et l'icône tray."""
+    """Arrête proprement la surveillance et l'icône tray."""
     stop_event.set()
+
     if tray_icon is not None:
         try:
             tray_icon.stop()
@@ -331,23 +481,38 @@ def request_shutdown():
 
 
 # --------------------------------------------------------------------------
-# Icône barre d'état système (system tray)
+# Icône barre d'état système
 # --------------------------------------------------------------------------
 
 def make_icon_image():
-    """Dessine une petite icône ronde verte façon 'Spotify' avec une note."""
+    """Dessine une petite icône ronde verte façon Spotify."""
     size = 64
-    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+    image = Image.new(
+        "RGBA",
+        (size, size),
+        (0, 0, 0, 0),
+    )
+
     draw = ImageDraw.Draw(image)
 
-    # Cercle vert de fond
-    draw.ellipse((2, 2, size - 2, size - 2), fill=(30, 215, 96, 255))
+    # Cercle vert
+    draw.ellipse(
+        (2, 2, size - 2, size - 2),
+        fill=(30, 215, 96, 255),
+    )
 
-    # Trois arcs blancs façon logo Spotify
+    # Trois arcs blancs
     for i, y in enumerate((22, 32, 42)):
         offset = i * 3
+
         draw.arc(
-            (14 + offset, y - 6, size - 14 - offset, y + 10),
+            (
+                14 + offset,
+                y - 6,
+                size - 14 - offset,
+                y + 10,
+            ),
             start=200,
             end=340,
             fill=(255, 255, 255, 255),
@@ -358,106 +523,198 @@ def make_icon_image():
 
 
 def tray_action(func):
-    """Petit wrapper pour lancer une action tray sans bloquer le thread de l'icône."""
+    """
+    Lance une action tray dans un thread séparé
+    pour ne pas bloquer l'icône.
+    """
+
     def handler(icon, item):
-        threading.Thread(target=func, daemon=True).start()
+        threading.Thread(
+            target=func,
+            daemon=True,
+        ).start()
+
     return handler
 
 
 def build_menu():
-    """Construit dynamiquement le menu (en-tête = morceau en cours)."""
+    """Construit dynamiquement le menu."""
     data = get_metadata()
+
     if data:
         title = data["title"] or "Inconnu"
         artist = data["artist"] or "Inconnu"
-        header = f"{title} — {artist}" if title != "Inconnu" else "Spotify"
+
+        header = (
+            f"{title} — {artist}"
+            if title != "Inconnu"
+            else "Spotify"
+        )
+
         state = data["status"].capitalize()
+
     else:
         header = "Spotify (indisponible)"
         state = "—"
 
     return pystray.Menu(
-        Item(header, None, enabled=False),
-        Item(state, None, enabled=False),
+        Item(
+            header,
+            None,
+            enabled=False,
+        ),
+
+        Item(
+            state,
+            None,
+            enabled=False,
+        ),
+
         pystray.Menu.SEPARATOR,
-        Item("▶️ Lecture", tray_action(lambda: playerctl("play"))),
-        Item("⏸️ Pause", tray_action(lambda: playerctl("pause"))),
-        Item("⏯️ Lecture / Pause", tray_action(lambda: playerctl("play-pause"))),
-        Item("⏭️ Suivant", tray_action(lambda: playerctl("next"))),
-        Item("⏮️ Précédent", tray_action(lambda: playerctl("previous"))),
+
+        Item(
+            "▶️ Lecture",
+            tray_action(lambda: playerctl("play")),
+        ),
+
+        Item(
+            "⏸️ Pause",
+            tray_action(lambda: playerctl("pause")),
+        ),
+
+        Item(
+            "⏯️ Lecture / Pause",
+            tray_action(lambda: playerctl("play-pause")),
+        ),
+
+        Item(
+            "⏭️ Suivant",
+            tray_action(lambda: playerctl("next")),
+        ),
+
+        Item(
+            "⏮️ Précédent",
+            tray_action(lambda: playerctl("previous")),
+        ),
+
         pystray.Menu.SEPARATOR,
-        Item("🔁 Redémarrer Spotify", tray_action(restart_spotify)),
+
+        Item(
+            "🔁 Redémarrer Spotify",
+            tray_action(restart_spotify),
+        ),
+
         pystray.Menu.SEPARATOR,
-        Item("❌ Quitter", tray_action(request_shutdown)),
+
+        Item(
+            "❌ Quitter",
+            tray_action(request_shutdown),
+        ),
     )
 
 
 def refresh_tray():
-    """À appeler après un changement d'état pour rafraîchir le menu/titre de l'icône."""
+    """Rafraîchit le menu et le titre de l'icône."""
     if tray_icon is None:
         return
+
     try:
         data = get_metadata()
+
         if data and data["title"]:
-            tray_icon.title = f"{data['title']} — {data['artist'] or 'Inconnu'}"
+            tray_icon.title = (
+                f"{data['title']} — "
+                f"{data['artist'] or 'Inconnu'}"
+            )
         else:
             tray_icon.title = "Auto Spotify"
+
         tray_icon.menu = build_menu()
+
     except Exception:
         pass
 
 
 def build_tray_icon():
-    """Crée (sans le démarrer) l'objet pystray.Icon."""
+    """Crée l'objet pystray.Icon."""
     image = make_icon_image()
+
     icon = pystray.Icon(
         "auto-spotify",
         icon=image,
         title="Auto Spotify",
         menu=build_menu(),
     )
+
     return icon
 
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
 
 def main():
     global tray_icon
 
+    # Vérification de playerctl
     if shutil.which("playerctl") is None:
         print("❌ playerctl n'est pas installé ou absent du PATH.")
-        print("Installe playerctl puis relance le programme.")
+        print("   Installe playerctl puis relance le programme.")
         return 1
 
+    # Démarre Spotify
     start_spotify()
 
     print("🎵 Auto Spotify démarré")
     print("🔎 Surveillance de Spotify...")
     print("🛑 Ctrl+C (ou 'stop') pour arrêter.")
+    print()
 
-    monitor = threading.Thread(target=monitor_loop, daemon=True)
+    # Thread de surveillance
+    monitor = threading.Thread(
+        target=monitor_loop,
+        daemon=True,
+    )
+
     monitor.start()
 
-    cmd_thread = threading.Thread(target=command_loop, daemon=True)
+    # Thread des commandes
+    cmd_thread = threading.Thread(
+        target=command_loop,
+        daemon=True,
+    )
+
     cmd_thread.start()
 
+    # System tray
     if TRAY_AVAILABLE:
+
         tray_icon = build_tray_icon()
+
         try:
-            # icon.run() bloque et doit tourner sur le thread principal.
+            # icon.run() doit tourner sur le thread principal
             tray_icon.run()
+
         finally:
             stop_event.set()
+
     else:
+
         print(
-            "\n⚠️ Icône de barre d'état désactivée : installe les dépendances avec\n"
+            "\n⚠️ Icône de barre d'état désactivée : "
+            "installe les dépendances avec\n"
             "   pip install pystray pillow\n"
         )
+
         try:
             while not stop_event.is_set():
                 time.sleep(0.5)
+
         except KeyboardInterrupt:
             stop_event.set()
 
     stop_event.set()
+
     monitor.join(timeout=1)
 
     return 0
